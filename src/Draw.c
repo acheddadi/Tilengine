@@ -21,8 +21,10 @@
 /* private prototypes */
 static void DrawSpriteCollision(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx);
 static void DrawSpriteCollisionScaling(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx, int srcx);
+static bool priority_cleared = false;
+static bool collision_cleared = false;
 
-static bool check_sprite_coverage(Sprite* sprite, int nscan)
+static inline bool check_sprite_coverage(Sprite* sprite, int nscan)
 {
 	/* check sprite coverage */
 	if (nscan < sprite->dstrect.y1 || nscan >= sprite->dstrect.y2)
@@ -170,7 +172,7 @@ bool DrawScanline(void)
 	if (engine->numlayers > 0)
 	{
 		background_priority = false;
-		memset(engine->priority, 0, engine->framebuffer.pitch);
+		priority_cleared = false;
 		for (c = engine->numlayers - 1; c >= 0; c--)
 		{
 			Layer* layer = &engine->layers[c];
@@ -186,14 +188,20 @@ bool DrawScanline(void)
 
 			/* draw */
 			if (layer->ok && !layer->priority)
-				background_priority |= draw_background_scanline(c, line);
+			{
+				if (layer->window.invert || layer->window.color != 0 || layer->mosaic.h != 0 || layer->mode >= MODE_TRANSFORM ||
+					(layer->window.x1 < layer->window.x2 && line >= layer->window.y1 && line <= layer->window.y2))
+				{
+					background_priority |= draw_background_scanline(c, line);
+				}
+			}
 		}
 	}
 
 	/* draw regular sprites */
 	if (engine->numsprites > 0)
 	{
-		memset(engine->collision, -1, engine->framebuffer.width * sizeof(uint16_t));
+		collision_cleared = false;
 		list = &engine->list_sprites;
 		index = list->first;
 		while (index != -1)
@@ -212,7 +220,22 @@ bool DrawScanline(void)
 			if (check_sprite_coverage(sprite, line))
 			{
 				if (!(sprite->flags & FLAG_PRIORITY))
-					sprite->draw(index, scan, line, 0, 0);
+				{
+					if (sprite->mode == MODE_NORMAL && (sprite->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) == 0)
+					{
+						const int w = sprite->dstrect.x2 - sprite->dstrect.x1;
+						if (w > 0)
+						{
+							const int srcy = sprite->srcrect.y1 + (line - sprite->dstrect.y1);
+							uint8_t* srcpixel = sprite->pixels + (srcy * sprite->pitch) + sprite->srcrect.x1;
+							sprite->blitter(srcpixel, sprite->palette, scan + sprite->dstrect.x1, w, 1, 0, sprite->blend);
+							if (sprite->do_collision)
+								DrawSpriteCollision(index, srcpixel, engine->collision + sprite->dstrect.x1, w, 1);
+						}
+					}
+					else
+						sprite->draw(index, scan, line, 0, 0);
+				}
 				else
 					sprite_priority = true;
 			}
@@ -386,13 +409,18 @@ static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1
 			uint32_t *dst = dstpixel;
 			if (tile->flags & FLAG_PRIORITY)
 			{
+				if (!priority_cleared)
+				{
+					memset(engine->priority, 0, engine->framebuffer.pitch);
+					priority_cleared = true;
+				}
 				dst = engine->priority;
 				priority = true;
 			}
 
 			int line = GetTilesetLine(tileset, tile_index, scan.srcy);
 			bool color_key = *(tileset->color_key + line);
-			layer->blitters[1](srcpixel, palette, dst + x, width, scan.dx, 0, layer->blend);
+			layer->blitters[color_key](srcpixel, palette, dst + x, width, scan.dx, 0, layer->blend);
 		}
 
 		/* next tile */
@@ -483,6 +511,11 @@ static bool DrawTiledScanlineScaling(int nlayer, uint32_t* dstpixel, int nscan, 
 			uint32_t *dst = dstpixel;
 			if (tile->flags & FLAG_PRIORITY)
 			{
+				if (!priority_cleared)
+				{
+					memset(engine->priority, 0, engine->framebuffer.pitch);
+					priority_cleared = true;
+				}
 				dst = engine->priority;
 				priority = true;
 			}
@@ -699,6 +732,12 @@ static bool DrawScalingSpriteScanline(int nsprite, uint32_t* dstscan, int nscan,
 /* updates per-pixel sprite collision buffer */
 static void DrawSpriteCollision(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx)
 {
+	if (!collision_cleared)
+	{
+		memset(engine->collision, -1, engine->framebuffer.width * sizeof(uint16_t));
+		collision_cleared = true;
+	}
+
 	while (width)
 	{
 		if (*srcpixel)
@@ -719,9 +758,15 @@ static void DrawSpriteCollision(int nsprite, uint8_t *srcpixel, uint16_t *dstpix
 /* updates per-pixel sprite collision buffer for scaled sprite */
 static void DrawSpriteCollisionScaling(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx, int srcx)
 {
+	if (!collision_cleared)
+	{
+		memset(engine->collision, -1, engine->framebuffer.width * sizeof(uint16_t));
+		collision_cleared = true;
+	}
+
 	while (width)
 	{
-		uint32_t src = *(srcpixel + srcx / (1 << FIXED_BITS));
+		uint32_t src = *(srcpixel + (srcx >> FIXED_BITS));
 		if (src)
 		{
 			if (*dstpixel != 0xFFFF)
@@ -948,6 +993,11 @@ static bool DrawObjectScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx
 			uint32_t *target = dstscan;
 			if (tmpobject.flags & FLAG_PRIORITY)
 			{
+				if (!priority_cleared)
+				{
+					memset(engine->priority, 0, engine->framebuffer.pitch);
+					priority_cleared = true;
+				}
 				target = engine->priority;
 				priority = true;
 			}

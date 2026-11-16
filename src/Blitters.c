@@ -59,7 +59,7 @@ static void blitFastScaling_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* 
 	uint32_t* color = (uint32_t*)palette->data;
 	while (width)
 	{
-		uint32_t src = *(srcpixel + offset/(1 << FIXED_BITS));
+		uint32_t src = *(srcpixel + (offset >> FIXED_BITS));
 		*dstpixel++ = color[src];
 		offset += dx;
 		width--;
@@ -74,7 +74,7 @@ static void blitFastBlendScaling_8_32 (uint8_t *srcpixel, TLN_Palette palette, v
 	dst = (uint8_t*)dstptr;
 	while (width)
 	{
-		uint32_t item = *(srcpixel + offset/(1 << FIXED_BITS));
+		uint32_t item = *(srcpixel + (offset >> FIXED_BITS));
 		src = (uint8_t*)&color[item];
 		dst[0] = blendfunc(blend, src[0], dst[0]);
 		dst[1] = blendfunc(blend, src[1], dst[1]);
@@ -90,6 +90,54 @@ static void blitKey_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* dstptr, 
 {
 	uint32_t* dstpixel = (uint32_t*)dstptr;
 	uint32_t* color = (uint32_t*)palette->data;
+
+	if (dx == 1)
+	{
+		while (((uintptr_t)srcpixel & 3) && width > 0)
+		{
+			if (*srcpixel)
+				*dstpixel = color[*srcpixel];
+			srcpixel++;
+			dstpixel++;
+			width--;
+		}
+
+		while (width >= 4)
+		{
+			uint32_t px = *(const uint32_t*)srcpixel;
+			if (px != 0)
+			{
+				if (((px - 0x01010101U) & ~px & 0x80808080U) == 0)
+				{
+					dstpixel[0] = color[srcpixel[0]];
+					dstpixel[1] = color[srcpixel[1]];
+					dstpixel[2] = color[srcpixel[2]];
+					dstpixel[3] = color[srcpixel[3]];
+				}
+				else
+				{
+					if (srcpixel[0]) dstpixel[0] = color[srcpixel[0]];
+					if (srcpixel[1]) dstpixel[1] = color[srcpixel[1]];
+					if (srcpixel[2]) dstpixel[2] = color[srcpixel[2]];
+					if (srcpixel[3]) dstpixel[3] = color[srcpixel[3]];
+				}
+			}
+			srcpixel += 4;
+			dstpixel += 4;
+			width -= 4;
+		}
+
+		while (width > 0)
+		{
+			if (*srcpixel)
+				*dstpixel = color[*srcpixel];
+			srcpixel++;
+			dstpixel++;
+			width--;
+		}
+		return;
+	}
+
 	while (width)
 	{
 		if (*srcpixel)
@@ -128,7 +176,7 @@ static void blitKeyScaling_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* d
 	uint32_t* color = (uint32_t*)palette->data;
 	while (width)
 	{
-		uint32_t src = *(srcpixel + offset/(1 << FIXED_BITS));
+		uint32_t src = *(srcpixel + (offset >> FIXED_BITS));
 		if (src)
 			*dstpixel = color[src];
 
@@ -146,7 +194,7 @@ static void blitKeyBlendScaling_8_32 (uint8_t *srcpixel, TLN_Palette palette, vo
 	dst = (uint8_t*)dstptr;
 	while (width)
 	{
-		uint32_t item = *(srcpixel + offset/(1 << FIXED_BITS));
+		uint32_t item = *(srcpixel + (offset >> FIXED_BITS));
 		if (item)
 		{
 			src = (uint8_t*)&color[item];
@@ -202,6 +250,26 @@ void BlitColor(void* dstptr, uint32_t color, int width, uint8_t* blend)
 	else
 	{
 		uint32_t* dstpixel = (uint32_t*)dstptr;
+#ifdef DREAMCAST
+		while (((uintptr_t)dstpixel & 31) && width > 0)
+		{
+			*dstpixel++ = color;
+			width--;
+		}
+		while (width >= 8)
+		{
+			__asm__ __volatile__("movca.l %0, @%1" : : "z"(color), "r"(dstpixel) : "memory");
+			dstpixel[1] = color;
+			dstpixel[2] = color;
+			dstpixel[3] = color;
+			dstpixel[4] = color;
+			dstpixel[5] = color;
+			dstpixel[6] = color;
+			dstpixel[7] = color;
+			dstpixel += 8;
+			width -= 8;
+		}
+#endif
 		while (width)
 		{
 			*dstpixel++ = color;

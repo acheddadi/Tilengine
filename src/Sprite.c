@@ -792,6 +792,10 @@ bool TLN_SetFirstSprite(int nsprite)
 	ListLinkNodes(list, nsprite, list->first);
 	ListLinkNodes(list, cut1, cut2);
 	list->first = nsprite;
+	if (list->last == nsprite)
+	{
+		list->last = cut1;
+	}
 
 	debugmsg("%s(%d)\t", __FUNCTION__, nsprite);
 	ListPrint(list);
