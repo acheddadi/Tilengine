@@ -24,6 +24,131 @@ static void DrawSpriteCollisionScaling(int nsprite, uint8_t *srcpixel, uint16_t 
 static bool priority_cleared = false;
 static bool collision_cleared = false;
 
+static void blitKeyUnblended_8_32(
+	const uint8_t* __restrict__ srcpixel,
+	const uint32_t* __restrict__ color,
+	uint32_t* __restrict__ dstpixel,
+	int w)
+{
+	while (((uintptr_t)srcpixel & 3) && w > 0)
+	{
+		if (*srcpixel)
+			*dstpixel = color[*srcpixel];
+		srcpixel++;
+		dstpixel++;
+		w--;
+	}
+
+	while (w >= 8)
+	{
+		uint32_t px0, px1;
+		memcpy(&px0, srcpixel, sizeof(px0));
+		memcpy(&px1, srcpixel + 4, sizeof(px1));
+		if ((px0 | px1) != 0)
+		{
+			const uint32_t zero_mask =
+				((px0 - 0x01010101U) & ~px0 & 0x80808080U) |
+				((px1 - 0x01010101U) & ~px1 & 0x80808080U);
+			if (zero_mask == 0)
+			{
+#ifdef DREAMCAST
+				if (((uintptr_t)dstpixel & 31) == 0)
+				{
+					const uint32_t c0 = color[(uint8_t)px0];
+					__asm__ __volatile__("movca.l %0, @%1" : : "z"(c0), "r"(dstpixel) : "memory");
+					dstpixel[1] = color[(uint8_t)(px0 >> 8)];
+					dstpixel[2] = color[(uint8_t)(px0 >> 16)];
+					dstpixel[3] = color[(uint8_t)(px0 >> 24)];
+					dstpixel[4] = color[(uint8_t)px1];
+					dstpixel[5] = color[(uint8_t)(px1 >> 8)];
+					dstpixel[6] = color[(uint8_t)(px1 >> 16)];
+					dstpixel[7] = color[(uint8_t)(px1 >> 24)];
+					srcpixel += 8;
+					dstpixel += 8;
+					w -= 8;
+					continue;
+				}
+#endif
+				dstpixel[0] = color[(uint8_t)px0];
+				dstpixel[1] = color[(uint8_t)(px0 >> 8)];
+				dstpixel[2] = color[(uint8_t)(px0 >> 16)];
+				dstpixel[3] = color[(uint8_t)(px0 >> 24)];
+				dstpixel[4] = color[(uint8_t)px1];
+				dstpixel[5] = color[(uint8_t)(px1 >> 8)];
+				dstpixel[6] = color[(uint8_t)(px1 >> 16)];
+				dstpixel[7] = color[(uint8_t)(px1 >> 24)];
+			}
+			else
+			{
+				if (px0 != 0)
+				{
+					const uint8_t p0 = (uint8_t)px0;
+					const uint8_t p1 = (uint8_t)(px0 >> 8);
+					const uint8_t p2 = (uint8_t)(px0 >> 16);
+					const uint8_t p3 = (uint8_t)(px0 >> 24);
+					if (p0) dstpixel[0] = color[p0];
+					if (p1) dstpixel[1] = color[p1];
+					if (p2) dstpixel[2] = color[p2];
+					if (p3) dstpixel[3] = color[p3];
+				}
+				if (px1 != 0)
+				{
+					const uint8_t p4 = (uint8_t)px1;
+					const uint8_t p5 = (uint8_t)(px1 >> 8);
+					const uint8_t p6 = (uint8_t)(px1 >> 16);
+					const uint8_t p7 = (uint8_t)(px1 >> 24);
+					if (p4) dstpixel[4] = color[p4];
+					if (p5) dstpixel[5] = color[p5];
+					if (p6) dstpixel[6] = color[p6];
+					if (p7) dstpixel[7] = color[p7];
+				}
+			}
+		}
+		srcpixel += 8;
+		dstpixel += 8;
+		w -= 8;
+	}
+
+	while (w >= 4)
+	{
+		uint32_t px;
+		memcpy(&px, srcpixel, sizeof(px));
+		if (px != 0)
+		{
+			const uint8_t p0 = (uint8_t)px;
+			const uint8_t p1 = (uint8_t)(px >> 8);
+			const uint8_t p2 = (uint8_t)(px >> 16);
+			const uint8_t p3 = (uint8_t)(px >> 24);
+			if (((px - 0x01010101U) & ~px & 0x80808080U) == 0)
+			{
+				dstpixel[0] = color[p0];
+				dstpixel[1] = color[p1];
+				dstpixel[2] = color[p2];
+				dstpixel[3] = color[p3];
+			}
+			else
+			{
+				if (p0) dstpixel[0] = color[p0];
+				if (p1) dstpixel[1] = color[p1];
+				if (p2) dstpixel[2] = color[p2];
+				if (p3) dstpixel[3] = color[p3];
+			}
+		}
+		srcpixel += 4;
+		dstpixel += 4;
+		w -= 4;
+	}
+
+	while (w > 0)
+	{
+		if (*srcpixel)
+			*dstpixel = color[*srcpixel];
+		srcpixel++;
+		dstpixel++;
+		w--;
+	}
+}
+
 static inline bool check_sprite_coverage(Sprite* sprite, int nscan)
 {
 	/* check sprite coverage */
@@ -150,10 +275,117 @@ bool DrawScanline(void)
 	bool background_priority = false;	/* at least one tile in priority layer */
 	bool sprite_priority = false;		/* at least one sprite in priority layer */
 	List* list;
+	int solid_x1 = 0, solid_y1 = 0, solid_x2 = 0, solid_y2 = 0;
+	int best_solid_area = 0;
 
 	/* call raster effect callback */
 	if (engine->cb_raster)
 		engine->cb_raster(line);
+
+	/* build per-frame sprite buckets and find largest inscribed solid rect on first scanline */
+	if (line != engine->last_sprite_cache_line + 1)
+	{
+		if (engine->numsprites > 0 && engine->numsprites <= UINT16_MAX &&
+			engine->cb_raster == NULL &&
+			engine->framebuffer.width > 0 && engine->framebuffer.width <= INT16_MAX &&
+			engine->framebuffer.height > 0 && engine->framebuffer.height <= INT16_MAX &&
+			engine->active_sprites != NULL && engine->line_sprite_indices != NULL && engine->line_sprite_counts != NULL)
+		{
+			const int fb_height = engine->framebuffer.height;
+			const int fb_width = engine->framebuffer.width;
+			const int max_sprites = engine->numsprites;
+			ActiveSpriteEntry* cached_sprites = engine->active_sprites;
+			uint16_t* bucket_indices = engine->line_sprite_indices;
+			uint16_t* bucket_counts = engine->line_sprite_counts;
+			int count = 0;
+
+			list = &engine->list_sprites;
+			memset(bucket_counts, 0, sizeof(uint16_t) * (size_t)fb_height);
+			index = list->first;
+			while (index != -1 && count < max_sprites)
+			{
+				Sprite* sprite = &engine->sprites[index];
+				if (sprite->world_space && (sprite->dirty || engine->dirty))
+				{
+					sprite->x = sprite->xworld - engine->xworld;
+					sprite->y = sprite->yworld - engine->yworld;
+					UpdateSprite(sprite);
+					sprite->dirty = false;
+				}
+
+				if (sprite->dstrect.y1 < sprite->dstrect.y2 &&
+					sprite->dstrect.x1 < sprite->dstrect.x2 &&
+					sprite->dstrect.y2 > 0 && sprite->dstrect.y1 < fb_height &&
+					sprite->dstrect.x2 > 0 && sprite->dstrect.x1 < fb_width &&
+					sprite->srcrect.x2 >= 0)
+				{
+					const int y1 = sprite->dstrect.y1 < 0 ? 0 : sprite->dstrect.y1;
+					const int y2 = sprite->dstrect.y2 > fb_height ? fb_height : sprite->dstrect.y2;
+					const uint16_t entry_idx = (uint16_t)count++;
+					ActiveSpriteEntry* entry = &cached_sprites[entry_idx];
+					entry->index = index;
+					entry->y1 = (int16_t)y1;
+					entry->y2 = (int16_t)y2;
+					entry->x1 = (int16_t)sprite->dstrect.x1;
+					entry->w = (int16_t)(sprite->dstrect.x2 - sprite->dstrect.x1);
+					entry->flags = sprite->flags;
+					entry->is_fast_normal = (sprite->mode == MODE_NORMAL &&
+						sprite->dstrect.y1 >= 0 &&
+						(sprite->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE | FLAG_PRIORITY)) == 0 &&
+						!sprite->do_collision) ? 1 : 0;
+					entry->pitch = sprite->pitch;
+					entry->src_row_base = sprite->pixels + (sprite->srcrect.y1 * sprite->pitch) + sprite->srcrect.x1;
+					entry->palette = sprite->palette;
+					entry->blitter = sprite->blitter;
+					entry->blend = sprite->blend;
+
+					if (line == 0 && sprite->mode == MODE_NORMAL && sprite->blend == NULL &&
+						(sprite->flags & (FLAG_ROTATE | FLAG_MASKED)) == 0 &&
+						sprite->info != NULL && sprite->info->solid_x2 > sprite->info->solid_x1 &&
+						sprite->info->solid_y2 > sprite->info->solid_y1)
+					{
+						const int sw = sprite->info->w;
+						const int sh = sprite->info->h;
+						const int bx = sprite->x - (int)(sw * sprite->ptx);
+						const int by = sprite->y - (int)(sh * sprite->pty);
+						int sx1 = (sprite->flags & FLAG_FLIPX) ? (bx + sw - sprite->info->solid_x2) : (bx + sprite->info->solid_x1);
+						int sx2 = (sprite->flags & FLAG_FLIPX) ? (bx + sw - sprite->info->solid_x1) : (bx + sprite->info->solid_x2);
+						int sy1 = (sprite->flags & FLAG_FLIPY) ? (by + sh - sprite->info->solid_y2) : (by + sprite->info->solid_y1);
+						int sy2 = (sprite->flags & FLAG_FLIPY) ? (by + sh - sprite->info->solid_y1) : (by + sprite->info->solid_y2);
+
+						if (sx1 < 0) sx1 = 0;
+						if (sy1 < 0) sy1 = 0;
+						if (sx2 > fb_width) sx2 = fb_width;
+						if (sy2 > fb_height) sy2 = fb_height;
+
+						if (sx2 > sx1 && sy2 > sy1)
+						{
+							const int area = (sx2 - sx1) * (sy2 - sy1);
+							if (area > best_solid_area)
+							{
+								best_solid_area = area;
+								solid_x1 = sx1;
+								solid_y1 = sy1;
+								solid_x2 = sx2;
+								solid_y2 = sy2;
+							}
+						}
+					}
+
+					for (int y = y1; y < y2; y++)
+					{
+						const uint16_t pos = bucket_counts[y]++;
+						bucket_indices[(y * max_sprites) + pos] = entry_idx;
+					}
+				}
+				index = sprite->list_node.next;
+			}
+			engine->active_sprite_count = count;
+			engine->use_active_sprite_cache = true;
+		}
+		else
+			engine->use_active_sprite_cache = false;
+	}
 
 	/* background is bitmap */
 	if (engine->bgbitmap && engine->bgpalette)
@@ -166,7 +398,37 @@ bool DrawScanline(void)
 
 	/* background is solid color */
 	else if (engine->bgcolor)
-		BlitColor(scan, engine->bgcolor, size, NULL);
+	{
+		if (engine->cb_raster == NULL && engine->framebuffer.pitch == size * (int)sizeof(uint32_t))
+		{
+			if (line != engine->last_sprite_cache_line + 1)
+			{
+				const int fb_height = engine->framebuffer.height;
+				if (line == 0 && best_solid_area > 0)
+				{
+					const uint32_t bg = engine->bgcolor;
+					if (solid_y1 > 0)
+						BlitColor(scan, bg, size * solid_y1, NULL);
+
+					for (int y = solid_y1; y < solid_y2; y++)
+					{
+						uint32_t* row = scan + (y * size);
+						for (int x = 0; x < solid_x1; x++)
+							row[x] = bg;
+						for (int x = solid_x2; x < size; x++)
+							row[x] = bg;
+					}
+
+					if (solid_y2 < fb_height)
+						BlitColor(scan + (solid_y2 * size), bg, size * (fb_height - solid_y2), NULL);
+				}
+				else
+					BlitColor(scan, engine->bgcolor, size * (fb_height - line), NULL);
+			}
+		}
+		else
+			BlitColor(scan, engine->bgcolor, size, NULL);
+	}
 
 	/* draw regular background layers */
 	if (engine->numlayers > 0)
@@ -203,43 +465,90 @@ bool DrawScanline(void)
 	{
 		collision_cleared = false;
 		list = &engine->list_sprites;
-		index = list->first;
-		while (index != -1)
+
+		if (engine->use_active_sprite_cache)
 		{
-			Sprite* sprite = &engine->sprites[index];
+			const int bucket_count = engine->line_sprite_counts[line];
+			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->numsprites];
+			const ActiveSpriteEntry* cached_sprites = engine->active_sprites;
+			const bool line_masked = (line >= engine->sprite_mask_top && line <= engine->sprite_mask_bottom);
 
-			/* update if dirty */
-			if (sprite->world_space && (sprite->dirty || engine->dirty))
+			for (c = 0; c < bucket_count; c++)
 			{
-				sprite->x = sprite->xworld - engine->xworld;
-				sprite->y = sprite->yworld - engine->yworld;
-				UpdateSprite(sprite);
-				sprite->dirty = false;
-			}
+				const ActiveSpriteEntry* entry = &cached_sprites[bucket[c]];
+				if (line_masked && (entry->flags & FLAG_MASKED))
+					continue;
 
-			if (check_sprite_coverage(sprite, line))
-			{
-				if (!(sprite->flags & FLAG_PRIORITY))
+				if (entry->is_fast_normal)
 				{
-					if (sprite->mode == MODE_NORMAL && (sprite->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) == 0)
+					if (entry->blend == NULL)
 					{
-						const int w = sprite->dstrect.x2 - sprite->dstrect.x1;
-						if (w > 0)
-						{
-							const int srcy = sprite->srcrect.y1 + (line - sprite->dstrect.y1);
-							uint8_t* srcpixel = sprite->pixels + (srcy * sprite->pitch) + sprite->srcrect.x1;
-							sprite->blitter(srcpixel, sprite->palette, scan + sprite->dstrect.x1, w, 1, 0, sprite->blend);
-							if (sprite->do_collision)
-								DrawSpriteCollision(index, srcpixel, engine->collision + sprite->dstrect.x1, w, 1);
-						}
+						blitKeyUnblended_8_32(
+							entry->src_row_base + ((line - entry->y1) * entry->pitch),
+							(const uint32_t*)entry->palette->data,
+							scan + entry->x1,
+							entry->w);
 					}
 					else
-						sprite->draw(index, scan, line, 0, 0);
+					{
+						entry->blitter(
+							(uint8_t*)(entry->src_row_base + ((line - entry->y1) * entry->pitch)),
+							entry->palette,
+							scan + entry->x1,
+							entry->w,
+							1,
+							0,
+							entry->blend);
+					}
+				}
+				else if (!(entry->flags & FLAG_PRIORITY))
+				{
+					engine->sprites[entry->index].draw(entry->index, scan, line, 0, 0);
 				}
 				else
 					sprite_priority = true;
 			}
-			index = sprite->list_node.next;
+		}
+		else
+		{
+			index = list->first;
+			while (index != -1)
+			{
+				Sprite* sprite = &engine->sprites[index];
+
+				/* update if dirty */
+				if (sprite->world_space && (sprite->dirty || engine->dirty))
+				{
+					sprite->x = sprite->xworld - engine->xworld;
+					sprite->y = sprite->yworld - engine->yworld;
+					UpdateSprite(sprite);
+					sprite->dirty = false;
+				}
+
+				if (check_sprite_coverage(sprite, line))
+				{
+					if (!(sprite->flags & FLAG_PRIORITY))
+					{
+						if (sprite->mode == MODE_NORMAL && (sprite->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) == 0)
+						{
+							const int w = sprite->dstrect.x2 - sprite->dstrect.x1;
+							if (w > 0)
+							{
+								const int srcy = sprite->srcrect.y1 + (line - sprite->dstrect.y1);
+								uint8_t* srcpixel = sprite->pixels + (srcy * sprite->pitch) + sprite->srcrect.x1;
+								sprite->blitter(srcpixel, sprite->palette, scan + sprite->dstrect.x1, w, 1, 0, sprite->blend);
+								if (sprite->do_collision)
+									DrawSpriteCollision(index, srcpixel, engine->collision + sprite->dstrect.x1, w, 1);
+							}
+						}
+						else
+							sprite->draw(index, scan, line, 0, 0);
+					}
+					else
+						sprite_priority = true;
+				}
+				index = sprite->list_node.next;
+			}
 		}
 	}
 
@@ -271,17 +580,37 @@ bool DrawScanline(void)
 	/* draw sprites with priority */
 	if (sprite_priority == true)
 	{
-		index = list->first;
-		while (index != -1)
+		if (engine->use_active_sprite_cache)
 		{
-			Sprite* sprite = &engine->sprites[index];
-			if (check_sprite_coverage(sprite, line) && (sprite->flags & FLAG_PRIORITY))
-				sprite->draw(index, scan, line, 0, 0);
-			index = sprite->list_node.next;
+			const int bucket_count = engine->line_sprite_counts[line];
+			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->numsprites];
+			const ActiveSpriteEntry* cached_sprites = engine->active_sprites;
+			const bool line_masked = (line >= engine->sprite_mask_top && line <= engine->sprite_mask_bottom);
+			for (c = 0; c < bucket_count; c++)
+			{
+				const ActiveSpriteEntry* entry = &cached_sprites[bucket[c]];
+				if (entry->flags & FLAG_PRIORITY)
+				{
+					if (!(line_masked && (entry->flags & FLAG_MASKED)))
+						engine->sprites[entry->index].draw(entry->index, scan, line, 0, 0);
+				}
+			}
+		}
+		else
+		{
+			index = list->first;
+			while (index != -1)
+			{
+				Sprite* sprite = &engine->sprites[index];
+				if (check_sprite_coverage(sprite, line) && (sprite->flags & FLAG_PRIORITY))
+					sprite->draw(index, scan, line, 0, 0);
+				index = sprite->list_node.next;
+			}
 		}
 	}
 
 	/* next scanline */
+	engine->last_sprite_cache_line = line;
 	engine->dirty = false;
 	engine->line++;
 	return engine->line < engine->framebuffer.height;

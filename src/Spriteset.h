@@ -21,6 +21,15 @@ typedef struct
 	uint32_t hash;
 	int w,h;
 	int offset;
+	int16_t trim_x1;
+	int16_t trim_y1;
+	int16_t trim_x2;
+	int16_t trim_y2;
+	int16_t solid_x1;
+	int16_t solid_y1;
+	int16_t solid_x2;
+	int16_t solid_y2;
+	bool trimmed;
 }
 SpriteEntry;
 

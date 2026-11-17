@@ -22,12 +22,36 @@
 #include "Blitters.h"
 #include "List.h"
 
+typedef struct
+{
+	int32_t index;
+	int16_t y1;
+	int16_t y2;
+	int16_t x1;
+	int16_t w;
+	uint8_t is_fast_normal;
+	uint8_t pad;
+	uint16_t flags;
+	int32_t pitch;
+	const uint8_t* src_row_base;
+	TLN_Palette palette;
+	ScanBlitPtr blitter;
+	uint8_t* blend;
+}
+ActiveSpriteEntry;
+
 /* motor */
 typedef struct Engine
 {
 	uint32_t	header;			/* object signature to identify as engine context */
 	uint32_t*	priority;		/* buffer receiving tiles with priority */
 	uint16_t*	collision;		/* buffer with sprite coverage IDs for per-pixel collision */
+	ActiveSpriteEntry* active_sprites;		/* per-frame cached active sprite list */
+	uint16_t*	line_sprite_indices;		/* per-scanline sprite index buckets */
+	uint16_t*	line_sprite_counts;			/* sprite count per scanline bucket */
+	int			active_sprite_count;		/* number of active sprites in current frame */
+	int			last_sprite_cache_line;		/* last scanline processed for sprite cache */
+	bool		use_active_sprite_cache;	/* true if active sprite cache is valid */
 	uint32_t*	linebuffer;		/* buffer for intermediate scanline output  */
 	int			numsprites;		/* number of sprites */
 	Sprite*		sprites;		/* pointer to sprite buffer */

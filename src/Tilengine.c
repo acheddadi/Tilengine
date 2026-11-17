@@ -86,6 +86,7 @@ static TLN_Engine create_context(int hres, int vres, int numlayers, int numsprit
 	context->framebuffer.height = vres;
 	context->framebuffer.pitch = (((hres * 32)>>3) + 3) & ~0x03;
 	context->target_fps = INTERNAL_FPS;
+	context->last_sprite_cache_line = -2;
 
 	/* create static layers */
 	if (numlayers > 0)
@@ -128,6 +129,14 @@ static TLN_Engine create_context(int hres, int vres, int numlayers, int numsprit
 
 		/* sprite collision buffer */
 		context->collision = (uint16_t*)calloc(hres, sizeof(uint16_t));
+
+		/* per-frame sprite cache and scanline buckets */
+		if (numsprites <= UINT16_MAX && hres <= INT16_MAX && vres > 0 && vres <= INT16_MAX)
+		{
+			context->active_sprites = (ActiveSpriteEntry*)calloc(numsprites, sizeof(ActiveSpriteEntry));
+			context->line_sprite_indices = (uint16_t*)malloc((size_t)numsprites * (size_t)vres * sizeof(uint16_t));
+			context->line_sprite_counts = (uint16_t*)calloc(vres, sizeof(uint16_t));
+		}
 	}
 
 	/* create static animations */
@@ -249,6 +258,15 @@ bool TLN_DeleteContext(TLN_Engine context)
 
 	if (context->sprites)
 		free(context->sprites);
+
+	if (context->active_sprites)
+		free(context->active_sprites);
+
+	if (context->line_sprite_indices)
+		free(context->line_sprite_indices);
+
+	if (context->line_sprite_counts)
+		free(context->line_sprite_counts);
 
 	if (context->layers)
 		free(context->layers);

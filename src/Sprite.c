@@ -113,13 +113,16 @@ bool TLN_SetSpriteSet (int nsprite, TLN_Spriteset spriteset)
  */
 bool TLN_SetSpriteFlags (int nsprite, uint32_t flags)
 {
+	Sprite* sprite;
 	if (nsprite >= engine->numsprites)
 	{
 		TLN_SetLastError (TLN_ERR_IDX_SPRITE);
 		return false;
 	}
 	
-	engine->sprites[nsprite].flags = flags;
+	sprite = &engine->sprites[nsprite];
+	sprite->flags = flags;
+	UpdateSprite (sprite);
 	TLN_SetLastError (TLN_ERR_OK);
 	return true;
 }
@@ -132,17 +135,20 @@ bool TLN_SetSpriteFlags (int nsprite, uint32_t flags)
 */
 bool TLN_EnableSpriteFlag(int nsprite, uint32_t flag, bool enable)
 {
+	Sprite* sprite;
 	if (nsprite >= engine->numsprites)
 	{
 		TLN_SetLastError(TLN_ERR_IDX_SPRITE);
 		return false;
 	}
 
+	sprite = &engine->sprites[nsprite];
 	if (enable)
-		engine->sprites[nsprite].flags |= flag;
+		sprite->flags |= flag;
 	else
-		engine->sprites[nsprite].flags &= ~flag;
+		sprite->flags &= ~flag;
 
+	UpdateSprite (sprite);
 	TLN_SetLastError(TLN_ERR_OK);
 	return true;
 }
@@ -380,10 +386,13 @@ bool TLN_SetSpriteScaling (int nsprite, float sx, float sy)
 	sprite = &engine->sprites[nsprite];
 	sprite->sx = sx;
 	sprite->sy = sy;
-	sprite->mode = MODE_SCALING;
-	sprite->draw = GetSpriteDraw (sprite->mode);
+	if (sprite->mode != MODE_SCALING)
+	{
+		sprite->mode = MODE_SCALING;
+		sprite->draw = GetSpriteDraw (sprite->mode);
+		SelectSpriteBlitter (sprite);
+	}
 	UpdateSprite (sprite);
-	SelectSpriteBlitter (sprite);
 	return true;
 }
 
@@ -408,12 +417,15 @@ bool TLN_ResetSpriteScaling (int nsprite)
 	
 	sprite = &engine->sprites[nsprite];
 	sprite->sx = sprite->sy = 1.0f;
-	sprite->mode = MODE_NORMAL;
-	sprite->draw = GetSpriteDraw (sprite->mode);
+	if (sprite->mode != MODE_NORMAL)
+	{
+		sprite->mode = MODE_NORMAL;
+		sprite->draw = GetSpriteDraw (sprite->mode);
+		SelectSpriteBlitter (sprite);
+	}
 	UpdateSprite (sprite);
 	
 	TLN_SetLastError (TLN_ERR_OK);
-	SelectSpriteBlitter (sprite);
 	return true;
 }
 
@@ -924,8 +936,46 @@ void UpdateSprite (Sprite* sprite)
 		int x = sprite->x - (int)(w * sprite->ptx);
 		int y = sprite->y - (int)(h * sprite->pty);
 
-		/* screen target rectangle */
-		MakeRect(&sprite->dstrect, x, y, w, h);
+		int trim_x1 = 0;
+		int trim_y1 = 0;
+		int trim_x2 = w;
+		int trim_y2 = h;
+
+		if ((sprite->flags & FLAG_ROTATE) == 0 && sprite->info->trimmed)
+		{
+			if (sprite->info->trim_x1 >= sprite->info->trim_x2 || sprite->info->trim_y1 >= sprite->info->trim_y2)
+			{
+				MakeRect(&sprite->srcrect, 0, 0, 0, 0);
+				MakeRect(&sprite->dstrect, x, y, 0, 0);
+				return;
+			}
+
+			if (sprite->flags & FLAG_FLIPX)
+			{
+				trim_x1 = w - sprite->info->trim_x2;
+				trim_x2 = w - sprite->info->trim_x1;
+			}
+			else
+			{
+				trim_x1 = sprite->info->trim_x1;
+				trim_x2 = sprite->info->trim_x2;
+			}
+
+			if (sprite->flags & FLAG_FLIPY)
+			{
+				trim_y1 = h - sprite->info->trim_y2;
+				trim_y2 = h - sprite->info->trim_y1;
+			}
+			else
+			{
+				trim_y1 = sprite->info->trim_y1;
+				trim_y2 = sprite->info->trim_y2;
+			}
+		}
+
+		/* sprite source & screen target rectangles */
+		MakeRect(&sprite->srcrect, trim_x1, trim_y1, trim_x2 - trim_x1, trim_y2 - trim_y1);
+		MakeRect(&sprite->dstrect, x + trim_x1, y + trim_y1, trim_x2 - trim_x1, trim_y2 - trim_y1);
 
 		/* vertical clipping */
 		if (sprite->dstrect.y1 < 0)
@@ -958,27 +1008,82 @@ void UpdateSprite (Sprite* sprite)
 		w = (int)(sprite->info->w * sprite->sx);
 		h = (int)(sprite->info->h * sprite->sy);
 
-		/* screen target rectangle */
-		sprite->dstrect.x1 = sprite->x - (int)(w * sprite->ptx);
-		sprite->dstrect.y1 = sprite->y - (int)(h * sprite->pty);
-		sprite->dstrect.x2 = sprite->dstrect.x1 + w;
-		sprite->dstrect.y2 = sprite->dstrect.y1 + h;
+		int base_x = sprite->x - (int)(w * sprite->ptx);
+		int base_y = sprite->y - (int)(h * sprite->pty);
+
+		int trim_x1 = 0;
+		int trim_y1 = 0;
+		int trim_x2 = sprite->info->w;
+		int trim_y2 = sprite->info->h;
+
+		if (sprite->info->trimmed)
+		{
+			if (sprite->info->trim_x1 >= sprite->info->trim_x2 || sprite->info->trim_y1 >= sprite->info->trim_y2)
+			{
+				MakeRect(&sprite->srcrect, 0, 0, 0, 0);
+				MakeRect(&sprite->dstrect, base_x, base_y, 0, 0);
+				return;
+			}
+			trim_x1 = sprite->info->trim_x1;
+			trim_y1 = sprite->info->trim_y1;
+			trim_x2 = sprite->info->trim_x2;
+			trim_y2 = sprite->info->trim_y2;
+		}
+
+		int dst_off_x1 = (int)(trim_x1 * sprite->sx);
+		int dst_off_y1 = (int)(trim_y1 * sprite->sy);
+		int dst_off_x2 = (int)(trim_x2 * sprite->sx);
+		int dst_off_y2 = (int)(trim_y2 * sprite->sy);
+
+		int src_trim_x1 = trim_x1;
+		int src_trim_y1 = trim_y1;
+		int src_trim_x2 = trim_x2;
+		int src_trim_y2 = trim_y2;
+
+		if (sprite->flags & FLAG_FLIPX)
+		{
+			sprite->dstrect.x1 = base_x + (w - dst_off_x2);
+			sprite->dstrect.x2 = base_x + (w - dst_off_x1);
+			src_trim_x1 = sprite->info->w - trim_x2;
+			src_trim_x2 = sprite->info->w - trim_x1;
+		}
+		else
+		{
+			sprite->dstrect.x1 = base_x + dst_off_x1;
+			sprite->dstrect.x2 = base_x + dst_off_x2;
+		}
+
+		if (sprite->flags & FLAG_FLIPY)
+		{
+			sprite->dstrect.y1 = base_y + (h - dst_off_y2);
+			sprite->dstrect.y2 = base_y + (h - dst_off_y1);
+			src_trim_y1 = sprite->info->h - trim_y2;
+			src_trim_y2 = sprite->info->h - trim_y1;
+		}
+		else
+		{
+			sprite->dstrect.y1 = base_y + dst_off_y1;
+			sprite->dstrect.y2 = base_y + dst_off_y2;
+		}
 
 		/* source coords are 16.16 fixed point */
-		sprite->srcrect.x1 = int2fix (sprite->srcrect.x1);
-		sprite->srcrect.y1 = int2fix (sprite->srcrect.y1);
-		sprite->srcrect.x2 = int2fix (sprite->srcrect.x2);
-		sprite->srcrect.y2 = int2fix (sprite->srcrect.y2);
+		sprite->srcrect.x1 = int2fix (src_trim_x1);
+		sprite->srcrect.y1 = int2fix (src_trim_y1);
+		sprite->srcrect.x2 = int2fix (src_trim_x2);
+		sprite->srcrect.y2 = int2fix (src_trim_y2);
 
 		int srcw = sprite->srcrect.x2 - sprite->srcrect.x1;
 		int srch = sprite->srcrect.y2 - sprite->srcrect.y1;
 		int dstw = sprite->dstrect.x2 - sprite->dstrect.x1;
 		int dsth = sprite->dstrect.y2 - sprite->dstrect.y1;
 
-		sprite->dx = srcw/dstw;
-		sprite->dy = srch/dsth;
-
-		/* TODO */
+#ifdef DREAMCAST
+		sprite->dx = dstw > 0 ? (int)((float)srcw / (float)dstw) : 0;
+		sprite->dy = dsth > 0 ? (int)((float)srch / (float)dsth) : 0;
+#else
+		sprite->dx = dstw > 0 ? srcw / dstw : 0;
+		sprite->dy = dsth > 0 ? srch / dsth : 0;
+#endif
 
 		/* clipping vertical */
 		if (sprite->dstrect.y1 < 0)

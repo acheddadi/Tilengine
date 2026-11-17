@@ -13,6 +13,7 @@
 #include "Blitters.h"
 #include "Tables.h"
 #include "Engine.h"
+#include <string.h>
 
 /* indexes for blitter array table */
 #define BLIT_BLEND		0
@@ -26,6 +27,21 @@ static void blitFast_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* dstptr,
 {
 	uint32_t* dstpixel = (uint32_t*)dstptr;
 	uint32_t* color = (uint32_t*)palette->data;
+
+	if (dx == 1)
+	{
+		while (width >= 4)
+		{
+			dstpixel[0] = color[srcpixel[0]];
+			dstpixel[1] = color[srcpixel[1]];
+			dstpixel[2] = color[srcpixel[2]];
+			dstpixel[3] = color[srcpixel[3]];
+			srcpixel += 4;
+			dstpixel += 4;
+			width -= 4;
+		}
+	}
+
 	while (width)
 	{
 		*dstpixel++ = color[*srcpixel];
@@ -104,22 +120,27 @@ static void blitKey_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* dstptr, 
 
 		while (width >= 4)
 		{
-			uint32_t px = *(const uint32_t*)srcpixel;
+			uint32_t px;
+			memcpy(&px, srcpixel, sizeof(px));
 			if (px != 0)
 			{
+				const uint8_t p0 = (uint8_t)px;
+				const uint8_t p1 = (uint8_t)(px >> 8);
+				const uint8_t p2 = (uint8_t)(px >> 16);
+				const uint8_t p3 = (uint8_t)(px >> 24);
 				if (((px - 0x01010101U) & ~px & 0x80808080U) == 0)
 				{
-					dstpixel[0] = color[srcpixel[0]];
-					dstpixel[1] = color[srcpixel[1]];
-					dstpixel[2] = color[srcpixel[2]];
-					dstpixel[3] = color[srcpixel[3]];
+					dstpixel[0] = color[p0];
+					dstpixel[1] = color[p1];
+					dstpixel[2] = color[p2];
+					dstpixel[3] = color[p3];
 				}
 				else
 				{
-					if (srcpixel[0]) dstpixel[0] = color[srcpixel[0]];
-					if (srcpixel[1]) dstpixel[1] = color[srcpixel[1]];
-					if (srcpixel[2]) dstpixel[2] = color[srcpixel[2]];
-					if (srcpixel[3]) dstpixel[3] = color[srcpixel[3]];
+					if (p0) dstpixel[0] = color[p0];
+					if (p1) dstpixel[1] = color[p1];
+					if (p2) dstpixel[2] = color[p2];
+					if (p3) dstpixel[3] = color[p3];
 				}
 			}
 			srcpixel += 4;
@@ -174,6 +195,21 @@ static void blitKeyScaling_8_32 (uint8_t *srcpixel, TLN_Palette palette, void* d
 {
 	uint32_t* dstpixel = (uint32_t*)dstptr;
 	uint32_t* color = (uint32_t*)palette->data;
+
+	while (width >= 4)
+	{
+		uint32_t s0 = srcpixel[offset >> FIXED_BITS]; offset += dx;
+		uint32_t s1 = srcpixel[offset >> FIXED_BITS]; offset += dx;
+		uint32_t s2 = srcpixel[offset >> FIXED_BITS]; offset += dx;
+		uint32_t s3 = srcpixel[offset >> FIXED_BITS]; offset += dx;
+		if (s0) dstpixel[0] = color[s0];
+		if (s1) dstpixel[1] = color[s1];
+		if (s2) dstpixel[2] = color[s2];
+		if (s3) dstpixel[3] = color[s3];
+		dstpixel += 4;
+		width -= 4;
+	}
+
 	while (width)
 	{
 		uint32_t src = *(srcpixel + (offset >> FIXED_BITS));
@@ -270,6 +306,15 @@ void BlitColor(void* dstptr, uint32_t color, int width, uint8_t* blend)
 			width -= 8;
 		}
 #endif
+		while (width >= 4)
+		{
+			dstpixel[0] = color;
+			dstpixel[1] = color;
+			dstpixel[2] = color;
+			dstpixel[3] = color;
+			dstpixel += 4;
+			width -= 4;
+		}
 		while (width)
 		{
 			*dstpixel++ = color;
