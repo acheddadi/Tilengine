@@ -65,6 +65,7 @@ TLN_Tilemap TLN_CreateTilemap (int rows, int cols, TLN_Tile tiles, uint32_t bgco
 	tilemap->bgcolor = bgcolor;
 	tilemap->tilesets[0] = tileset;
 	tilemap->visible = true;
+	tilemap->bounds_dirty = true;
 
 	if (tiles)
 		memcpy (tilemap->tiles, tiles, tilemap->size - sizeof(struct Tilemap));
@@ -289,6 +290,7 @@ bool TLN_SetTilemapTile (TLN_Tilemap tilemap, int row, int col, TLN_Tile tile)
 		if (dsttile != NULL)
 		{
 			dsttile->value = tile != NULL ? tile->value : 0;
+			tilemap->bounds_dirty = true;
 			TLN_SetLastError (TLN_ERR_OK);
 			return true;
 		}
@@ -317,6 +319,7 @@ TLN_Tile TLN_GetTilemapTiles(TLN_Tilemap tilemap, int row, int col)
 	if (!CheckBaseObject(tilemap, OT_TILEMAP))
 		return NULL;
 
+	tilemap->bounds_dirty = true;
 	return GetTilemapPtr(tilemap, row, col);
 }
 
@@ -416,6 +419,7 @@ bool TLN_CopyTiles (TLN_Tilemap src, int srcrow, int srccol, int rows, int cols,
 				return false;
 			}
 		}
+		dst->bounds_dirty = true;
 	}
 
 	TLN_SetLastError (TLN_ERR_OK);

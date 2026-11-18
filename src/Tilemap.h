@@ -25,6 +25,11 @@ struct Tilemap
 	int		bgcolor;	/* background color */
 	int		id;			/* id property */
 	bool	visible;	/* visible property */
+	int		min_row;
+	int		max_row;
+	int		min_col;
+	int		max_col;
+	bool	bounds_dirty;
 	struct Tileset* tilesets[MAX_TILESETS]; /* attached tilesets */
 	Tile	tiles[];
 };

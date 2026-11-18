@@ -21,24 +21,31 @@
 /* private prototypes */
 static void DrawSpriteCollision(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx);
 static void DrawSpriteCollisionScaling(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx, int srcx);
-static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1, int tx2);
+static inline bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1, int tx2);
 static bool priority_cleared = false;
 static bool collision_cleared = false;
 
-static void blitKeyUnblended_8_32(
+static inline void blitKeyUnblended_8_32(
 	const uint8_t* __restrict__ srcpixel,
 	const uint32_t* __restrict__ color,
 	uint32_t* __restrict__ dstpixel,
 	int w)
 {
-	while (((uintptr_t)srcpixel & 3) && w > 0)
+#ifdef DREAMCAST
+	/* Align dstpixel to a 32-byte cache line boundary so all 8-pixel opaque spans use movca.l */
+	if (w >= 8 && (((uintptr_t)dstpixel & 31) != 0))
 	{
-		if (*srcpixel)
-			*dstpixel = color[*srcpixel];
-		srcpixel++;
-		dstpixel++;
-		w--;
+		int lead = (8 - (((uintptr_t)dstpixel >> 2) & 7)) & 7;
+		w -= lead;
+		while (lead-- > 0)
+		{
+			const uint8_t p = *srcpixel++;
+			if (p)
+				*dstpixel = color[p];
+			dstpixel++;
+		}
 	}
+#endif
 
 	while (w >= 8)
 	{
@@ -53,23 +60,16 @@ static void blitKeyUnblended_8_32(
 			if (zero_mask == 0)
 			{
 #ifdef DREAMCAST
-				if (((uintptr_t)dstpixel & 31) == 0)
-				{
-					const uint32_t c0 = color[(uint8_t)px0];
-					__asm__ __volatile__("movca.l %0, @%1" : : "z"(c0), "r"(dstpixel) : "memory");
-					dstpixel[1] = color[(uint8_t)(px0 >> 8)];
-					dstpixel[2] = color[(uint8_t)(px0 >> 16)];
-					dstpixel[3] = color[(uint8_t)(px0 >> 24)];
-					dstpixel[4] = color[(uint8_t)px1];
-					dstpixel[5] = color[(uint8_t)(px1 >> 8)];
-					dstpixel[6] = color[(uint8_t)(px1 >> 16)];
-					dstpixel[7] = color[(uint8_t)(px1 >> 24)];
-					srcpixel += 8;
-					dstpixel += 8;
-					w -= 8;
-					continue;
-				}
-#endif
+				const uint32_t c0 = color[(uint8_t)px0];
+				__asm__ __volatile__("movca.l %0, @%1" : : "z"(c0), "r"(dstpixel) : "memory");
+				dstpixel[1] = color[(uint8_t)(px0 >> 8)];
+				dstpixel[2] = color[(uint8_t)(px0 >> 16)];
+				dstpixel[3] = color[(uint8_t)(px0 >> 24)];
+				dstpixel[4] = color[(uint8_t)px1];
+				dstpixel[5] = color[(uint8_t)(px1 >> 8)];
+				dstpixel[6] = color[(uint8_t)(px1 >> 16)];
+				dstpixel[7] = color[(uint8_t)(px1 >> 24)];
+#else
 				dstpixel[0] = color[(uint8_t)px0];
 				dstpixel[1] = color[(uint8_t)(px0 >> 8)];
 				dstpixel[2] = color[(uint8_t)(px0 >> 16)];
@@ -78,6 +78,7 @@ static void blitKeyUnblended_8_32(
 				dstpixel[5] = color[(uint8_t)(px1 >> 8)];
 				dstpixel[6] = color[(uint8_t)(px1 >> 16)];
 				dstpixel[7] = color[(uint8_t)(px1 >> 24)];
+#endif
 			}
 			else
 			{
@@ -301,7 +302,6 @@ bool DrawScanline(void)
 			int count = 0;
 
 			list = &engine->list_sprites;
-			memset(bucket_counts, 0, sizeof(uint16_t) * (size_t)fb_height);
 			index = list->first;
 			while (index != -1 && count < max_sprites)
 			{
@@ -372,15 +372,37 @@ bool DrawScanline(void)
 							}
 						}
 					}
-
-					for (int y = y1; y < y2; y++)
-					{
-						const uint16_t pos = bucket_counts[y]++;
-						bucket_indices[(y * max_sprites) + pos] = entry_idx;
-					}
 				}
 				index = sprite->list_node.next;
 			}
+
+			memset(bucket_counts, 0, sizeof(uint16_t) * (size_t)fb_height);
+			for (int i = 0; i < count; i++)
+			{
+				const ActiveSpriteEntry* entry = &cached_sprites[i];
+				const int y1 = entry->y1;
+				const int y2 = entry->y2;
+				if ((entry->flags & FLAG_MASKED) && engine->sprite_mask_top <= engine->sprite_mask_bottom)
+				{
+					for (int y = y1; y < y2; y++)
+					{
+						if (y < engine->sprite_mask_top || y > engine->sprite_mask_bottom)
+						{
+							const uint16_t pos = bucket_counts[y]++;
+							bucket_indices[(y * count) + pos] = (uint16_t)i;
+						}
+					}
+				}
+				else
+				{
+					for (int y = y1; y < y2; y++)
+					{
+						const uint16_t pos = bucket_counts[y]++;
+						bucket_indices[(y * count) + pos] = (uint16_t)i;
+					}
+				}
+			}
+
 			engine->active_sprite_count = count;
 			engine->use_active_sprite_cache = true;
 		}
@@ -477,15 +499,12 @@ bool DrawScanline(void)
 		if (engine->use_active_sprite_cache)
 		{
 			const int bucket_count = engine->line_sprite_counts[line];
-			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->numsprites];
+			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->active_sprite_count];
 			const ActiveSpriteEntry* cached_sprites = engine->active_sprites;
-			const bool line_masked = (line >= engine->sprite_mask_top && line <= engine->sprite_mask_bottom);
 
 			for (c = 0; c < bucket_count; c++)
 			{
 				const ActiveSpriteEntry* entry = &cached_sprites[bucket[c]];
-				if (line_masked && (entry->flags & FLAG_MASKED))
-					continue;
 
 				if (entry->is_fast_normal)
 				{
@@ -600,17 +619,13 @@ bool DrawScanline(void)
 		if (engine->use_active_sprite_cache)
 		{
 			const int bucket_count = engine->line_sprite_counts[line];
-			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->numsprites];
+			const uint16_t* bucket = &engine->line_sprite_indices[line * engine->active_sprite_count];
 			const ActiveSpriteEntry* cached_sprites = engine->active_sprites;
-			const bool line_masked = (line >= engine->sprite_mask_top && line <= engine->sprite_mask_bottom);
 			for (c = 0; c < bucket_count; c++)
 			{
 				const ActiveSpriteEntry* entry = &cached_sprites[bucket[c]];
 				if (entry->flags & FLAG_PRIORITY)
-				{
-					if (!(line_masked && (entry->flags & FLAG_MASKED)))
-						engine->sprites[entry->index].draw(entry->index, scan, line, 0, 0);
-				}
+					engine->sprites[entry->index].draw(entry->index, scan, line, 0, 0);
 			}
 		}
 		else
@@ -688,32 +703,66 @@ static inline void process_flip_rotation(uint16_t flags, Tilescan* scan)
 	}
 }
 
+static inline void update_tilemap_bounds(TLN_Tilemap tilemap)
+{
+	const int rows = tilemap->rows;
+	const int cols = tilemap->cols;
+	int min_row = rows;
+	int max_row = -1;
+	int min_col = cols;
+	int max_col = -1;
+
+	const Tile* row_ptr = tilemap->tiles;
+	for (int r = 0; r < rows; r++, row_ptr += cols)
+	{
+		int c = 0;
+		while (c < cols && row_ptr[c].index == 0)
+			c++;
+		if (c < cols)
+		{
+			if (r < min_row)
+				min_row = r;
+			max_row = r;
+			if (c < min_col)
+				min_col = c;
+
+			int rc = cols - 1;
+			while (rc > c && row_ptr[rc].index == 0)
+				rc--;
+			if (rc > max_col)
+				max_col = rc;
+		}
+	}
+
+	tilemap->min_row = min_row;
+	tilemap->max_row = max_row;
+	tilemap->min_col = min_col;
+	tilemap->max_col = max_col;
+	tilemap->bounds_dirty = false;
+}
+
 /* draw scanline of tiled background */
-static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1, int tx2)
+static inline bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1, int tx2)
 {
 	const Layer *layer = (const Layer*)&engine->layers[nlayer];
 	bool priority = false;
 
-	int x = tx1;
 	const TLN_Tilemap tilemap = layer->tilemap;
 	const TLN_Tileset tileset = tilemap->tilesets[0];
 	const int tile_w = tileset->width;
 	const int layer_width = layer->width;
 	const int layer_height = layer->height;
 	const int cols = tilemap->cols;
-	int xpos = layer->hstart + x;
-	if ((unsigned int)xpos >= (unsigned int)layer_width)
-	{
-		xpos %= layer_width;
-		if (xpos < 0)
-			xpos += layer_width;
-	}
-	int xtile = xpos >> tileset->hshift;
-	int srcx = xpos & tileset->hmask;
 
 	/* fast path: unblended 8px-wide tiles with no column offset table */
 	if (tile_w == 8 && layer->column == NULL && layer->blend == NULL)
 	{
+		if (tilemap->bounds_dirty)
+			update_tilemap_bounds(tilemap);
+
+		if (tilemap->max_row < 0)
+			return false;
+
 		int ypos = layer->vstart + nscan;
 		if ((unsigned int)ypos >= (unsigned int)layer_height)
 		{
@@ -722,6 +771,32 @@ static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1
 				ypos += layer_height;
 		}
 		const int ytile = ypos >> tileset->vshift;
+		if (ytile < tilemap->min_row || ytile > tilemap->max_row)
+			return false;
+
+		const int active_x1 = (tilemap->min_col << tileset->hshift) - layer->hstart;
+		const int active_x2 = ((tilemap->max_col + 1) << tileset->hshift) - layer->hstart;
+		if (active_x1 >= 0 && active_x2 <= layer_width)
+		{
+			if (tx1 < active_x1)
+				tx1 = active_x1;
+			if (tx2 > active_x2)
+				tx2 = active_x2;
+			if (tx1 >= tx2)
+				return false;
+		}
+
+		int x = tx1;
+		int xpos = layer->hstart + x;
+		if ((unsigned int)xpos >= (unsigned int)layer_width)
+		{
+			xpos %= layer_width;
+			if (xpos < 0)
+				xpos += layer_width;
+		}
+		int xtile = xpos >> tileset->hshift;
+		int srcx = xpos & tileset->hmask;
+
 		const int srcy = ypos & tileset->vmask;
 		const TLN_Tile row_tiles = &tilemap->tiles[ytile * cols];
 		const uint32_t* const base_color = layer->palette != NULL
@@ -980,7 +1055,18 @@ static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1
 		return priority;
 	}
 
-	/* general fallback for non-8px tilesets, column offsets, or blended layers */
+/* general fallback for non-8px tilesets, column offsets, or blended layers */
+	int x = tx1;
+	int xpos = layer->hstart + x;
+	if ((unsigned int)xpos >= (unsigned int)layer_width)
+	{
+		xpos %= layer_width;
+		if (xpos < 0)
+			xpos += layer_width;
+	}
+	int xtile = xpos >> tileset->hshift;
+	int srcx = xpos & tileset->hmask;
+
 	Tilescan scan;
 	scan.width = scan.height = scan.stride = tile_w;
 	scan.srcx = srcx;
