@@ -21,6 +21,7 @@
 /* private prototypes */
 static void DrawSpriteCollision(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx);
 static void DrawSpriteCollisionScaling(int nsprite, uint8_t *srcpixel, uint16_t *dstpixel, int width, int dx, int srcx);
+static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1, int tx2);
 static bool priority_cleared = false;
 static bool collision_cleared = false;
 
@@ -162,7 +163,7 @@ static inline bool check_sprite_coverage(Sprite* sprite, int nscan)
 }
 
 /* draw background scanline taking into account mosaic and windowing effects */
-static bool draw_background_scanline(int nlayer, int line)
+static inline bool draw_background_scanline(int nlayer, uint32_t* fb_scan, int line)
 {
 	/* draw */
 	Layer* layer = &engine->layers[nlayer];
@@ -189,7 +190,7 @@ static bool draw_background_scanline(int nlayer, int line)
 	else if (layer->mode >= MODE_TRANSFORM)
 		scan = engine->linebuffer;
 	else
-		scan = GetFramebufferLine(line);
+		scan = fb_scan;
 
 	if (scan == engine->linebuffer)
 		memset(scan, 0, engine->framebuffer.pitch);
@@ -213,7 +214,7 @@ static bool draw_background_scanline(int nlayer, int line)
 				priority |= layer->draw(nlayer, scan, line, 0, framewidth);
 		}
 	}
-	scan = GetFramebufferLine(line);
+	scan = fb_scan;
 
 	/* build mosaic to linebuffer */
 	if (build_mosaic)
@@ -451,10 +452,17 @@ bool DrawScanline(void)
 			/* draw */
 			if (layer->ok && !layer->priority)
 			{
-				if (layer->window.invert || layer->window.color != 0 || layer->mosaic.h != 0 || layer->mode >= MODE_TRANSFORM ||
+				if (layer->mosaic.h == 0 && layer->mode < MODE_TRANSFORM &&
+					!layer->window.invert && layer->window.color == 0 &&
+					layer->draw == DrawTiledScanline)
+				{
+					if (layer->window.x1 < layer->window.x2 && line >= layer->window.y1 && line <= layer->window.y2)
+						background_priority |= DrawTiledScanline(c, scan, line, layer->window.x1, layer->window.x2);
+				}
+				else if (layer->window.invert || layer->window.color != 0 || layer->mosaic.h != 0 || layer->mode >= MODE_TRANSFORM ||
 					(layer->window.x1 < layer->window.x2 && line >= layer->window.y1 && line <= layer->window.y2))
 				{
-					background_priority |= draw_background_scanline(c, line);
+					background_priority |= draw_background_scanline(c, scan, line);
 				}
 			}
 		}
@@ -559,10 +567,19 @@ bool DrawScanline(void)
 		{
 			Layer* layer = &engine->layers[c];
 			if (layer->ok && layer->priority)
-				draw_background_scanline(c, line);
+			{
+				if (layer->mosaic.h == 0 && layer->mode < MODE_TRANSFORM &&
+					!layer->window.invert && layer->window.color == 0 &&
+					layer->draw == DrawTiledScanline)
+				{
+					if (layer->window.x1 < layer->window.x2 && line >= layer->window.y1 && line <= layer->window.y2)
+						DrawTiledScanline(c, scan, line, layer->window.x1, layer->window.x2);
+				}
+				else
+					draw_background_scanline(c, scan, line);
+			}
 		}
 	}
-
 	/* overlay background tiles with priority */
 	if (background_priority == true)
 	{
@@ -676,65 +693,350 @@ static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1
 {
 	const Layer *layer = (const Layer*)&engine->layers[nlayer];
 	bool priority = false;
-	Tilescan scan = { 0 };
 
-	/* target lines */
 	int x = tx1;
 	const TLN_Tilemap tilemap = layer->tilemap;
 	const TLN_Tileset tileset = tilemap->tilesets[0];
-	int xpos = (layer->hstart + x) % layer->width;
+	const int tile_w = tileset->width;
+	const int layer_width = layer->width;
+	const int layer_height = layer->height;
+	const int cols = tilemap->cols;
+	int xpos = layer->hstart + x;
+	if ((unsigned int)xpos >= (unsigned int)layer_width)
+	{
+		xpos %= layer_width;
+		if (xpos < 0)
+			xpos += layer_width;
+	}
 	int xtile = xpos >> tileset->hshift;
+	int srcx = xpos & tileset->hmask;
 
-	scan.width = scan.height = scan.stride = tileset->width;
-	scan.srcx = xpos & tileset->hmask;
+	/* fast path: unblended 8px-wide tiles with no column offset table */
+	if (tile_w == 8 && layer->column == NULL && layer->blend == NULL)
+	{
+		int ypos = layer->vstart + nscan;
+		if ((unsigned int)ypos >= (unsigned int)layer_height)
+		{
+			ypos %= layer_height;
+			if (ypos < 0)
+				ypos += layer_height;
+		}
+		const int ytile = ypos >> tileset->vshift;
+		const int srcy = ypos & tileset->vmask;
+		const TLN_Tile row_tiles = &tilemap->tiles[ytile * cols];
+		const uint32_t* const base_color = layer->palette != NULL
+			? (const uint32_t*)layer->palette->data
+			: (const uint32_t*)tileset->palette->data;
 
-	/* fill whole scanline */
-	int column = x % tileset->width;
+		/* partial left-edge tile if scrolled mid-tile */
+		if (srcx != 0 && x < tx2)
+		{
+			const TLN_Tile tile = &row_tiles[xtile];
+			int width = 8 - srcx;
+			if (x + width > tx2)
+				width = tx2 - x;
+
+			if (tile->index)
+			{
+				const TLN_Tileset ts = (tile->tileset == 0) ? tileset : tilemap->tilesets[tile->tileset];
+				const uint16_t tile_index = ts->tiles[tile->index];
+				TLN_Palette palette = ts->palette;
+				if (layer->palette != NULL)
+					palette = layer->palette;
+				else if (engine->palettes[tile->palette] != NULL)
+					palette = engine->palettes[tile->palette];
+
+				Tilescan scan = { 8, 8, srcx, srcy, 1, 8 };
+				if ((tile->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) != 0)
+					process_flip_rotation(tile->flags, &scan);
+
+				uint8_t* srcpixel = &GetTilesetPixel(ts, tile_index, scan.srcx, scan.srcy);
+				uint32_t* dst = dstpixel;
+				if (tile->flags & FLAG_PRIORITY)
+				{
+					if (!priority_cleared)
+					{
+						memset(engine->priority, 0, engine->framebuffer.pitch);
+						priority_cleared = true;
+					}
+					dst = engine->priority;
+					priority = true;
+				}
+				const int tline = GetTilesetLine(ts, tile_index, scan.srcy);
+				const bool color_key = *(ts->color_key + tline);
+				layer->blitters[color_key](srcpixel, palette, dst + x, width, scan.dx, 0, NULL);
+			}
+
+			x += width;
+			if (++xtile >= cols)
+				xtile = 0;
+			srcx = 0;
+		}
+
+		/* full 8-pixel interior tiles */
+		const int x_limit = tx2 - 8;
+		while (x <= x_limit)
+		{
+			const TLN_Tile tile = &row_tiles[xtile];
+			if (++xtile >= cols)
+				xtile = 0;
+
+			if (tile->index == 0)
+			{
+				x += 8;
+				continue;
+			}
+
+			if ((tile->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) == 0)
+			{
+				const TLN_Tileset ts = (tile->tileset == 0) ? tileset : tilemap->tilesets[tile->tileset];
+				const uint32_t* color = base_color;
+				if (layer->palette == NULL && (tile->tileset != 0 || tile->palette != 0))
+				{
+					color = (engine->palettes[tile->palette] != NULL)
+						? (const uint32_t*)engine->palettes[tile->palette]->data
+						: (const uint32_t*)ts->palette->data;
+				}
+
+				const uint16_t tile_index = ts->tiles[tile->index];
+				const uint8_t* __restrict__ s = &GetTilesetPixel(ts, tile_index, 0, srcy);
+				const int tline = GetTilesetLine(ts, tile_index, srcy);
+				const bool color_key = *(ts->color_key + tline);
+
+				uint32_t* __restrict__ d = dstpixel + x;
+				if (tile->flags & FLAG_PRIORITY)
+				{
+					if (!priority_cleared)
+					{
+						memset(engine->priority, 0, engine->framebuffer.pitch);
+						priority_cleared = true;
+					}
+					d = engine->priority + x;
+					priority = true;
+				}
+
+				if (!color_key)
+				{
+#ifdef DREAMCAST
+					if (((uintptr_t)d & 31) == 0)
+					{
+						const uint32_t c0 = color[s[0]];
+						__asm__ __volatile__("movca.l %0, @%1" : : "z"(c0), "r"(d) : "memory");
+						d[1] = color[s[1]];
+						d[2] = color[s[2]];
+						d[3] = color[s[3]];
+						d[4] = color[s[4]];
+						d[5] = color[s[5]];
+						d[6] = color[s[6]];
+						d[7] = color[s[7]];
+						x += 8;
+						continue;
+					}
+#endif
+					d[0] = color[s[0]];
+					d[1] = color[s[1]];
+					d[2] = color[s[2]];
+					d[3] = color[s[3]];
+					d[4] = color[s[4]];
+					d[5] = color[s[5]];
+					d[6] = color[s[6]];
+					d[7] = color[s[7]];
+				}
+				else
+				{
+					uint32_t px0, px1;
+					memcpy(&px0, s, sizeof(px0));
+					memcpy(&px1, s + 4, sizeof(px1));
+					if ((px0 | px1) != 0)
+					{
+						const uint32_t zero_mask =
+							((px0 - 0x01010101U) & ~px0 & 0x80808080U) |
+							((px1 - 0x01010101U) & ~px1 & 0x80808080U);
+						if (zero_mask == 0)
+						{
+#ifdef DREAMCAST
+							if (((uintptr_t)d & 31) == 0)
+							{
+								const uint32_t c0 = color[(uint8_t)px0];
+								__asm__ __volatile__("movca.l %0, @%1" : : "z"(c0), "r"(d) : "memory");
+								d[1] = color[(uint8_t)(px0 >> 8)];
+								d[2] = color[(uint8_t)(px0 >> 16)];
+								d[3] = color[(uint8_t)(px0 >> 24)];
+								d[4] = color[(uint8_t)px1];
+								d[5] = color[(uint8_t)(px1 >> 8)];
+								d[6] = color[(uint8_t)(px1 >> 16)];
+								d[7] = color[(uint8_t)(px1 >> 24)];
+								x += 8;
+								continue;
+							}
+#endif
+							d[0] = color[(uint8_t)px0];
+							d[1] = color[(uint8_t)(px0 >> 8)];
+							d[2] = color[(uint8_t)(px0 >> 16)];
+							d[3] = color[(uint8_t)(px0 >> 24)];
+							d[4] = color[(uint8_t)px1];
+							d[5] = color[(uint8_t)(px1 >> 8)];
+							d[6] = color[(uint8_t)(px1 >> 16)];
+							d[7] = color[(uint8_t)(px1 >> 24)];
+						}
+						else
+						{
+							if (px0 != 0)
+							{
+								const uint8_t p0 = (uint8_t)px0;
+								const uint8_t p1 = (uint8_t)(px0 >> 8);
+								const uint8_t p2 = (uint8_t)(px0 >> 16);
+								const uint8_t p3 = (uint8_t)(px0 >> 24);
+								if (p0) d[0] = color[p0];
+								if (p1) d[1] = color[p1];
+								if (p2) d[2] = color[p2];
+								if (p3) d[3] = color[p3];
+							}
+							if (px1 != 0)
+							{
+								const uint8_t p4 = (uint8_t)px1;
+								const uint8_t p5 = (uint8_t)(px1 >> 8);
+								const uint8_t p6 = (uint8_t)(px1 >> 16);
+								const uint8_t p7 = (uint8_t)(px1 >> 24);
+								if (p4) d[4] = color[p4];
+								if (p5) d[5] = color[p5];
+								if (p6) d[6] = color[p6];
+								if (p7) d[7] = color[p7];
+							}
+						}
+					}
+				}
+			}
+			else
+			{
+				const TLN_Tileset ts = (tile->tileset == 0) ? tileset : tilemap->tilesets[tile->tileset];
+				const uint16_t tile_index = ts->tiles[tile->index];
+				TLN_Palette palette = ts->palette;
+				if (layer->palette != NULL)
+					palette = layer->palette;
+				else if (engine->palettes[tile->palette] != NULL)
+					palette = engine->palettes[tile->palette];
+
+				Tilescan scan = { 8, 8, 0, srcy, 1, 8 };
+				process_flip_rotation(tile->flags, &scan);
+
+				uint8_t* srcpixel = &GetTilesetPixel(ts, tile_index, scan.srcx, scan.srcy);
+				uint32_t* dst = dstpixel;
+				if (tile->flags & FLAG_PRIORITY)
+				{
+					if (!priority_cleared)
+					{
+						memset(engine->priority, 0, engine->framebuffer.pitch);
+						priority_cleared = true;
+					}
+					dst = engine->priority;
+					priority = true;
+				}
+				const int tline = GetTilesetLine(ts, tile_index, scan.srcy);
+				const bool color_key = *(ts->color_key + tline);
+				layer->blitters[color_key](srcpixel, palette, dst + x, 8, scan.dx, 0, NULL);
+			}
+
+			x += 8;
+		}
+
+		/* partial right-edge tile if any pixels remain */
+		if (x < tx2)
+		{
+			const TLN_Tile tile = &row_tiles[xtile];
+			const int width = tx2 - x;
+			if (tile->index)
+			{
+				const TLN_Tileset ts = (tile->tileset == 0) ? tileset : tilemap->tilesets[tile->tileset];
+				const uint16_t tile_index = ts->tiles[tile->index];
+				TLN_Palette palette = ts->palette;
+				if (layer->palette != NULL)
+					palette = layer->palette;
+				else if (engine->palettes[tile->palette] != NULL)
+					palette = engine->palettes[tile->palette];
+
+				Tilescan scan = { 8, 8, 0, srcy, 1, 8 };
+				if ((tile->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) != 0)
+					process_flip_rotation(tile->flags, &scan);
+
+				uint8_t* srcpixel = &GetTilesetPixel(ts, tile_index, scan.srcx, scan.srcy);
+				uint32_t* dst = dstpixel;
+				if (tile->flags & FLAG_PRIORITY)
+				{
+					if (!priority_cleared)
+					{
+						memset(engine->priority, 0, engine->framebuffer.pitch);
+						priority_cleared = true;
+					}
+					dst = engine->priority;
+					priority = true;
+				}
+				const int tline = GetTilesetLine(ts, tile_index, scan.srcy);
+				const bool color_key = *(ts->color_key + tline);
+				layer->blitters[color_key](srcpixel, palette, dst + x, width, scan.dx, 0, NULL);
+			}
+		}
+
+		return priority;
+	}
+
+	/* general fallback for non-8px tilesets, column offsets, or blended layers */
+	Tilescan scan;
+	scan.width = scan.height = scan.stride = tile_w;
+	scan.srcx = srcx;
+
+	int fixed_ypos = 0;
+	if (layer->column == NULL)
+	{
+		fixed_ypos = layer->vstart + nscan;
+		if ((unsigned int)fixed_ypos >= (unsigned int)layer_height)
+		{
+			fixed_ypos %= layer_height;
+			if (fixed_ypos < 0)
+				fixed_ypos += layer_height;
+		}
+	}
+
+	int column = x & tileset->hmask;
 	while (x < tx2)
 	{
-		/* column offset: update ypos */
 		int ypos;
 		if (layer->column)
 		{
-			ypos = (layer->vstart + nscan + layer->column[column]) % layer->height;
+			ypos = (layer->vstart + nscan + layer->column[column]) % layer_height;
 			if (ypos < 0)
-				ypos = layer->height + ypos;
+				ypos += layer_height;
 		}
 		else
-			ypos = (layer->vstart + nscan) % layer->height;
+			ypos = fixed_ypos;
 
 		int ytile = ypos >> tileset->vshift;
 		scan.srcy = ypos & tileset->vmask;
 
-		TLN_Tile tile = &tilemap->tiles[ytile*tilemap->cols + xtile];
+		TLN_Tile tile = &tilemap->tiles[ytile * cols + xtile];
 
-		/* get effective tile width */
-		int tilewidth = tileset->width - scan.srcx;
+		int tilewidth = tile_w - scan.srcx;
 		int x1 = x + tilewidth;
 		if (x1 > tx2)
 			x1 = tx2;
 		int width = x1 - x;
 
-		/* paint if not empty tile */
 		if (tile->index)
 		{
-			const TLN_Tileset tileset = tilemap->tilesets[tile->tileset];
-			const uint16_t tile_index = tileset->tiles[tile->index];
+			const TLN_Tileset ts = tilemap->tilesets[tile->tileset];
+			const uint16_t tile_index = ts->tiles[tile->index];
 
-			/* selects suitable palette */
-			TLN_Palette palette = tileset->palette;
+			TLN_Palette palette = ts->palette;
 			if (layer->palette != NULL)
 				palette = layer->palette;
 			else if (engine->palettes[tile->palette] != NULL)
 				palette = engine->palettes[tile->palette];
 
-			/* process rotate & flip flags */
 			scan.dx = 1;
-			if ((tile->flags & (FLAG_FLIPX + FLAG_FLIPY + FLAG_ROTATE)) != 0)
+			if ((tile->flags & (FLAG_FLIPX | FLAG_FLIPY | FLAG_ROTATE)) != 0)
 				process_flip_rotation(tile->flags, &scan);
 
-			/* paint tile scanline */
-			uint8_t *srcpixel = &GetTilesetPixel(tileset, tile_index, scan.srcx, scan.srcy);
+			uint8_t *srcpixel = &GetTilesetPixel(ts, tile_index, scan.srcx, scan.srcy);
 			uint32_t *dst = dstpixel;
 			if (tile->flags & FLAG_PRIORITY)
 			{
@@ -747,14 +1049,14 @@ static bool DrawTiledScanline(int nlayer, uint32_t* dstpixel, int nscan, int tx1
 				priority = true;
 			}
 
-			int line = GetTilesetLine(tileset, tile_index, scan.srcy);
-			bool color_key = *(tileset->color_key + line);
+			int line = GetTilesetLine(ts, tile_index, scan.srcy);
+			bool color_key = *(ts->color_key + line);
 			layer->blitters[color_key](srcpixel, palette, dst + x, width, scan.dx, 0, layer->blend);
 		}
 
-		/* next tile */
 		x += width;
-		xtile = (xtile + 1) % tilemap->cols;
+		if (++xtile >= cols)
+			xtile = 0;
 		scan.srcx = 0;
 		column += 1;
 	}
